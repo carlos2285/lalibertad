@@ -1,13 +1,13 @@
 
-import os, json
+import os, json, glob
 import streamlit as st
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 
-# Intentar importar pydeck; si no está, la app hará fallback a st.map
+# Try to import pydeck for polygon rendering
 try:
-    import pydeck as pdk  # type: ignore
+    import pydeck as pdk
     _HAS_PYDECK = True
 except Exception:
     _HAS_PYDECK = False
@@ -15,7 +15,7 @@ except Exception:
 st.set_page_config(page_title="Dashboard Territorio: Estructuras y Hogares", layout="wide")
 
 # ============================
-# Utilidades
+# Helpers
 # ============================
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -24,6 +24,19 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def to_lower_set(cols) -> set:
     return set([str(c).strip().lower() for c in cols])
+
+def find_firstExisting(candidates: List[str]) -> Optional[str]:
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+def auto_glob(patterns: List[str]) -> Optional[str]:
+    for pat in patterns:
+        hits = sorted(glob.glob(pat, recursive=True))
+        if hits:
+            return hits[0]
+    return None
 
 def load_excel_first_sheet(path: str) -> Tuple[pd.DataFrame, List[str]]:
     xls = pd.ExcelFile(path)
@@ -42,8 +55,8 @@ def low_cardinality_categoricals(df: pd.DataFrame, max_unique: int = 60) -> List
     return out
 
 def guess_lat_lon(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
-    lat_candidates = ["lat", "latitude", "y", "p002__latitude", "latitud"]
-    lon_candidates = ["lon", "lng", "longitude", "x", "p002__longitude", "longitud"]
+    lat_candidates = ["lat", "latitude", "y", "p002__latitude", "latitud", "coord_y", "y_wgs84"]
+    lon_candidates = ["lon", "lng", "longitude", "x", "p002__longitude", "longitud", "coord_x", "x_wgs84"]
     cols_lower = {str(c).lower(): c for c in df.columns}
     lat = next((cols_lower[c] for c in lat_candidates if c in cols_lower), None)
     lon = next((cols_lower[c] for c in lon_candidates if c in cols_lower), None)
@@ -55,9 +68,6 @@ def coerce_datetime(s: pd.Series) -> pd.Series:
     except Exception:
         return s
 
-# ============================
-# Codebook: parsing flexible
-# ============================
 def parse_codebook(df_cb: pd.DataFrame) -> Dict[str, Dict]:
     meta: Dict[str, Dict] = {}
     if df_cb is None or df_cb.empty:
@@ -162,8 +172,7 @@ def apply_codebook_types_and_labels(df: pd.DataFrame, meta: Dict[str, Dict], app
     return out
 
 def rank_join_candidates(cols_a: List[str], cols_b: List[str]) -> List[str]:
-    la = to_lower_set(cols_a)
-    lb = to_lower_set(cols_b)
+    la = to_lower_set(cols_a); lb = to_lower_set(cols_b)
     inter = list(la.intersection(lb))
     def score(name: str) -> int:
         s = 0
@@ -172,8 +181,7 @@ def rank_join_candidates(cols_a: List[str], cols_b: List[str]) -> List[str]:
         if "codigo" in name or "código" in name or "code" in name: s += 1
         if name.endswith("_id") or name.startswith("id_"): s += 2
         return s
-    inter_sorted = sorted(inter, key=lambda n: (-score(n), n))
-    return inter_sorted
+    return sorted(inter, key=lambda n: (-score(n), n))
 
 def pick_original_name(df: pd.DataFrame, lower_name: str) -> Optional[str]:
     for c in df.columns:
@@ -181,48 +189,105 @@ def pick_original_name(df: pd.DataFrame, lower_name: str) -> Optional[str]:
             return c
     return None
 
+def fix_decimal_commas(series: pd.Series) -> pd.Series:
+    """Replace comma decimal separators with dot and convert to numeric."""
+    s = series.astype(str).str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
 # ============================
-# Sidebar: Entrada de datos
+# Sidebar: Inputs
 # ============================
 st.sidebar.header("Datos de entrada")
-codebook_path = st.sidebar.text_input("Ruta Codebook", "data/metadata/Codebook.xlsx")
-estructuras_path = st.sidebar.text_input("Ruta Estructuras", "data/private/basedarboard.xlsx")
-hogares_path = st.sidebar.text_input("Ruta Hogares", "data/private/hogares.xlsx")
-apply_labels = st.sidebar.checkbox("Aplicar etiquetas del codebook (si existen)", value=True)
 
-# Capa de límites (GeoJSON exportado desde ArcGIS Pro)
-limite_path = st.sidebar.text_input("Ruta límites (GeoJSON)", "data/gis/areas_intervencion.geojson")
+# Try to auto-find files if the default doesn't exist
+codebook_default = find_firstExisting([
+    "data/metadata/Codebook.xlsx",
+    auto_glob("**/Codebook.xlsx")
+]) or "data/metadata/Codebook.xlsx"
+
+estructuras_default = find_firstExisting([
+    "data/private/basedarboard.xlsx",
+    auto_glob("**/basedarboard.xlsx")
+]) or "data/private/basedarboard.xlsx"
+
+hogares_default = find_firstExisting([
+    "data/private/hogares.xlsx",
+    auto_glob("**/hogares.xlsx")
+]) or "data/private/hogares.xlsx"
+
+limite_default = find_firstExisting([
+    "data/gis/areas_intervencion.geojson",
+    auto_glob("**/areas_intervencion.geojson"),
+    auto_glob("**/*intervencion*.geojson"),
+    auto_glob("**/*limite*.geojson")
+]) or "data/gis/areas_intervencion.geojson"
+
+codebook_path = st.sidebar.text_input("Ruta Codebook", codebook_default)
+estructuras_path = st.sidebar.text_input("Ruta Estructuras", estructuras_default)
+hogares_path = st.sidebar.text_input("Ruta Hogares", hogares_default)
+limite_path = st.sidebar.text_input("Ruta límites (GeoJSON)", limite_default)
+
+apply_labels = st.sidebar.checkbox("Aplicar etiquetas del codebook (si existen)", value=True)
 mostrar_limites = st.sidebar.checkbox("Mostrar límites de intervención", value=True)
 relleno_limites = st.sidebar.checkbox("Rellenar polígonos", value=False)
 
-# Carga de archivos
+# ============================
+# Load data with clear diagnostics
+# ============================
+with st.expander("🔎 Diagnóstico de archivos", expanded=True):
+    st.write({
+        "Codebook existe": os.path.exists(codebook_path),
+        "Estructuras existe": os.path.exists(estructuras_path),
+        "Hogares existe": os.path.exists(hogares_path),
+        "Límites (GeoJSON) existe": os.path.exists(limite_path),
+        "pydeck instalado": _HAS_PYDECK,
+    })
+
 with st.spinner("Leyendo archivos..."):
+    errs = []
     try:
         df_cb, _ = load_excel_first_sheet(codebook_path)
     except Exception as e:
-        st.error(f"No se pudo leer el Codebook: {e}")
+        errs.append(f"Codebook: {e}")
         df_cb = pd.DataFrame()
 
     try:
         df_estr, _ = load_excel_first_sheet(estructuras_path)
     except Exception as e:
-        st.error(f"No se pudo leer Estructuras: {e}")
+        errs.append(f"Estructuras: {e}")
         df_estr = pd.DataFrame()
 
     try:
         df_hog, _ = load_excel_first_sheet(hogares_path)
     except Exception as e:
-        st.error(f"No se pudo leer Hogares: {e}")
+        errs.append(f"Hogares: {e}")
         df_hog = pd.DataFrame()
+
+if errs:
+    st.warning("Problemas al leer archivos:\n- " + "\n- ".join(errs))
 
 df_cb = normalize_cols(df_cb) if not df_cb.empty else df_cb
 df_estr = normalize_cols(df_estr) if not df_estr.empty else df_estr
 df_hog = normalize_cols(df_hog) if not df_hog.empty else df_hog
 
+# Attempt to fix decimal commas in obvious lat/lon columns
+for df in [df_estr, df_hog]:
+    if not df.empty:
+        lat_c, lon_c = guess_lat_lon(df)
+        if lat_c and lon_c:
+            try:
+                df[lat_c] = fix_decimal_commas(df[lat_c])
+                df[lon_c] = fix_decimal_commas(df[lon_c])
+            except Exception:
+                pass
+
+# ============================
+# Codebook
+# ============================
 meta = parse_codebook(df_cb)
 
 # ============================
-# Unión Estructuras ↔ Hogares
+# Join
 # ============================
 st.sidebar.subheader("Unión Estructuras ↔ Hogares")
 if df_estr.empty:
@@ -244,7 +309,6 @@ if not df_estr.empty and not df_hog.empty:
         key_hog = pick_original_name(df_hog, join_key.lower())
         if key_hog is None and cands:
             key_hog = pick_original_name(df_hog, cands[0])
-
         if key_hog is None:
             st.error("No se encontró la columna equivalente en Hogares.")
         else:
@@ -257,18 +321,18 @@ if not df_estr.empty and not df_hog.empty:
 df_display = apply_codebook_types_and_labels(df_joined, meta, apply_labels=apply_labels)
 
 # ============================
-# Tabs principales
+# Tabs
 # ============================
 tab1, tab2 = st.tabs(["📊 Análisis", "📖 Diccionario"])
 
 with tab1:
     st.title("Dashboard del Territorio")
-    st.caption("Filtra y explora la información de estructuras y hogares.")
+    st.caption("Filtra y explora estructuras y hogares; muestra límites de intervención.")
 
-    # ---------- Filtros ----------
+    # --------- Filters ---------
     st.sidebar.subheader("Filtros")
     if df_display.empty:
-        st.info("No hay datos para filtrar.")
+        st.info("No hay datos para filtrar (revisa el diagnóstico de archivos y las rutas).")
         filtered = df_display
     else:
         candidatas = low_cardinality_categoricals(df_display)
@@ -288,7 +352,7 @@ with tab1:
             if picks:
                 filtered = filtered[filtered[col].isin(picks)]
 
-    # ---------- KPIs ----------
+    # --------- KPIs ---------
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Registros (vista)", len(filtered))
     with c2: st.metric("Variables", filtered.shape[1] if not filtered.empty else 0)
@@ -307,15 +371,37 @@ with tab1:
 
     st.divider()
 
-    # ---------- Mapa con límites ----------
+    # --------- Map ---------
     lat_col, lon_col = guess_lat_lon(filtered)
 
-    if mostrar_limites and os.path.exists(limite_path) and _HAS_PYDECK:
+    # Load GeoJSON if exists
+    gj = None
+    if mostrar_limites and os.path.exists(limite_path):
         try:
             with open(limite_path, "r", encoding="utf-8") as f:
                 gj = json.load(f)
+        except Exception as e:
+            st.warning(f"No se pudo leer el GeoJSON de límites: {e}")
 
-            layer_lim = pdk.Layer(
+    # Prepare points
+    pts = pd.DataFrame()
+    if lat_col and lon_col and not filtered.empty:
+        pts = filtered[[lat_col, lon_col]].dropna().rename(columns={lat_col:"lat", lon_col:"lon"})
+        pts["lat"] = pd.to_numeric(pts["lat"], errors="coerce")
+        pts["lon"] = pd.to_numeric(pts["lon"], errors="coerce")
+        pts = pts.dropna()
+
+    # Choose map center
+    if not pts.empty:
+        center_lat, center_lon = float(pts["lat"].median()), float(pts["lon"].median())
+    else:
+        # If no points, try to center over a known location (Puerto de La Libertad) or leave default
+        center_lat, center_lon = 13.494, -89.322
+
+    if _HAS_PYDECK and (gj is not None or not pts.empty):
+        layers = []
+        if gj is not None:
+            layers.append(pdk.Layer(
                 "GeoJsonLayer",
                 data=gj,
                 stroked=True,
@@ -324,53 +410,31 @@ with tab1:
                 get_line_width=2,
                 get_fill_color=[255, 255, 255, 30],
                 pickable=True,
-            )
-
-            layer_pts = None
-            if lat_col and lon_col and not filtered.empty:
-                pts = filtered[[lat_col, lon_col]].dropna().rename(columns={lat_col:"lat", lon_col:"lon"})
-                pts["lat"] = pd.to_numeric(pts["lat"], errors="coerce")
-                pts["lon"] = pd.to_numeric(pts["lon"], errors="coerce")
-                pts = pts.dropna()
-                if not pts.empty:
-                    layer_pts = pdk.Layer(
-                        "ScatterplotLayer",
-                        data=pts,
-                        get_position="[lon, lat]",
-                        get_radius=25,
-                        get_fill_color=[0, 128, 255, 160],
-                        pickable=False,
-                    )
-
-            if lat_col and lon_col and not filtered.empty and not pts.empty:
-                center_lat, center_lon = float(pts["lat"].median()), float(pts["lon"].median())
-            else:
-                center_lat, center_lon = 13.494, -89.322  # Puerto de La Libertad (aprox.)
-
-            st.subheader("Mapa (límites de intervención + puntos)")
-            st.pydeck_chart(pdk.Deck(
-                map_style=None,
-                initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=11),
-                layers=[l for l in [layer_lim, layer_pts] if l is not None],
             ))
-        except Exception as e:
-            st.warning(f"No se pudo renderizar la capa de límites: {e}")
+        if not pts.empty:
+            layers.append(pdk.Layer(
+                "ScatterplotLayer",
+                data=pts,
+                get_position="[lon, lat]",
+                get_radius=25,
+                get_fill_color=[0, 128, 255, 160],
+                pickable=False,
+            ))
+        st.subheader("Mapa")
+        st.pydeck_chart(pdk.Deck(
+            map_style=None,
+            initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=11),
+            layers=layers
+        ))
     else:
-        # Fallback: mapa simple con puntos (sin límites o sin pydeck)
-        if mostrar_limites and not _HAS_PYDECK:
-            st.info("Instala pydeck en requirements.txt para ver los límites (pydeck>=0.8,<1). Mostrando mapa simple de puntos.")
-        if lat_col and lon_col and not filtered.empty:
-            mdf = filtered[[lat_col, lon_col]].dropna().rename(columns={lat_col:"lat", lon_col:"lon"})
-            mdf["lat"] = pd.to_numeric(mdf["lat"], errors="coerce")
-            mdf["lon"] = pd.to_numeric(mdf["lon"], errors="coerce")
-            mdf = mdf.dropna()
-            if not mdf.empty:
-                st.subheader("Mapa")
-                st.map(mdf, size=3, zoom=11)
-            else:
-                st.info("No hay coordenadas válidas para mapear tras aplicar filtros.")
+        # Fallback simple map
+        if not pts.empty:
+            st.subheader("Mapa")
+            st.map(pts, size=3, zoom=11)
+        elif gj is not None:
+            st.info("pydeck no está disponible, por lo que no se puede dibujar el GeoJSON. Añade 'pydeck>=0.8,<1' en requirements.txt.")
         else:
-            st.info("No se detectaron columnas estándar de latitud/longitud.")
+            st.info("No hay puntos ni límites para mostrar. Revisa las rutas y las columnas de lat/lon.")
 
     st.subheader("Tabla filtrada")
     st.dataframe(filtered, use_container_width=True, height=420)
@@ -384,7 +448,7 @@ with tab1:
 
     st.divider()
 
-    # ---------- Exploración rápida ----------
+    # --------- Quick Aggr ---------
     if not filtered.empty:
         num_cols = [c for c in filtered.columns if pd.api.types.is_numeric_dtype(filtered[c])]
         if num_cols:
@@ -406,5 +470,3 @@ with tab2:
     else:
         st.dataframe(df_cb, use_container_width=True, height=600)
         st.caption("Activa 'Aplicar etiquetas del codebook' en la barra lateral para ver categorías decodificadas cuando existan.")
-
-st.caption("⚙️ Nota: Para ver límites con pydeck, agrega 'pydeck>=0.8,<1' en requirements.txt. La app hace fallback a un mapa simple si no está disponible.")
