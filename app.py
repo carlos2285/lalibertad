@@ -434,6 +434,96 @@ with tab1:
     st.divider()
 
     # ---------- Agregados + barras ----------
+
+    # ---------- Análisis estadístico avanzado ----------
+with st.expander("📈 Análisis estadístico", expanded=False):
+    if filtered.empty:
+        st.info("No hay datos en la vista filtrada.")
+    else:
+        # 1) Resumen estadístico de variables numéricas
+        num_cols = [c for c in filtered.columns if pd.api.types.is_numeric_dtype(filtered[c])]
+        st.subheader("Resumen numérico")
+        if not num_cols:
+            st.caption("No hay columnas numéricas para resumir.")
+        else:
+            sel_nums = st.multiselect("Variables numéricas", num_cols, default=num_cols[:min(6, len(num_cols))])
+            if sel_nums:
+                df_num = filtered[sel_nums]
+                desc = df_num.describe(percentiles=[0.25, 0.5, 0.75]).T
+                desc["missing_%"] = (1 - df_num.notna().mean()) * 100
+                st.dataframe(desc.round(3), use_container_width=True, height=340)
+                st.download_button(
+                    "⬇️ Descargar resumen (CSV)",
+                    data=desc.to_csv().encode("utf-8-sig"),
+                    file_name="resumen_estadistico.csv",
+                    mime="text/csv"
+                )
+
+        st.divider()
+
+        # 2) Tabla dinámica / Crosstab
+        st.subheader("Tabla dinámica (crosstab)")
+        cats = [c for c in low_card_cats(filtered) if filtered[c].notna().sum() > 0]
+        row_dim = st.selectbox("Filas", cats if cats else ["(sin categorías)"])
+        col_dim = st.selectbox("Columnas (opcional)", ["(ninguna)"] + cats)
+        value_opt = st.selectbox("Valor (numérico, opcional)", ["(conteo)"] + num_cols)
+        agg = st.selectbox("Agregación", ["count", "sum", "mean"], index=0)
+
+        if cats:
+            if value_opt == "(conteo)":
+                if col_dim == "(ninguna)":
+                    pt = filtered.groupby(row_dim).size().to_frame("conteo").sort_values("conteo", ascending=False)
+                else:
+                    pt = pd.crosstab(filtered[row_dim], filtered[col_dim])
+            else:
+                pt = pd.pivot_table(
+                    filtered,
+                    index=row_dim,
+                    columns=(None if col_dim == "(ninguna)" else col_dim),
+                    values=value_opt,
+                    aggfunc=agg,
+                    fill_value=0
+                )
+            st.dataframe(pt, use_container_width=True, height=380)
+            st.download_button(
+                "⬇️ Descargar crosstab (CSV)",
+                data=pt.to_csv().encode("utf-8-sig"),
+                file_name="crosstab.csv",
+                mime="text/csv"
+            )
+        else:
+            st.caption("No se detectaron columnas categóricas de baja cardinalidad.")
+
+        st.divider()
+
+        # 3) Histograma rápido
+        st.subheader("Distribución (histograma)")
+        if num_cols:
+            var_h = st.selectbox("Variable numérica", num_cols, index=0)
+            bins = st.slider("Bins", 5, 100, 30)
+            data = pd.to_numeric(filtered[var_h], errors="coerce").dropna()
+            if data.empty:
+                st.caption("No hay datos numéricos válidos para esta variable.")
+            else:
+                counts, edges = np.histogram(data, bins=bins)
+                centers = (edges[:-1] + edges[1:]) / 2
+                df_hist = pd.DataFrame({"bin": centers, "freq": counts}).set_index("bin")
+                st.bar_chart(df_hist)
+        else:
+            st.caption("No hay columnas numéricas para graficar.")
+
+        st.divider()
+
+        # 4) Top categorías
+        st.subheader("Top categorías")
+        if cats:
+            var_c = st.selectbox("Variable categórica", cats, index=0)
+            topn = st.slider("Top N", 5, 50, 15)
+            top = filtered[var_c].astype(str).value_counts().head(topn)
+            st.bar_chart(top)
+        else:
+            st.caption("Agrega una columna categórica (p. ej., SECTOR, Municipio) para ver Top categorías.")
+
     if not filtered.empty:
         cats_list = low_card_cats(filtered)
         dims = [d for d in [color_dim] if d is not None] or ([cats_list[0]] if cats_list else [])
