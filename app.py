@@ -88,16 +88,25 @@ def geojson_center(gj: dict) -> Tuple[float,float]:
     return 13.494, -89.322  # fallback
 
 # ====== Codebook (parser robusto + renombrado) ======
-def _find_col(cb, *aliases):
-    cols = {to_lower(c): c for c in cb.columns}
+ef _find_col(df, *aliases):
+    cols_lc = {str(c).strip().lower(): c for c in df.columns}
+    # match exacto primero
     for a in aliases:
-        if a in cols: return cols[a]
+        a_lc = str(a).strip().lower()
+        if a_lc in cols_lc: 
+            return cols_lc[a_lc]
+    # match por "contiene"
+    for a in aliases:
+        a_lc = str(a).strip().lower()
+        for k,orig in cols_lc.items():
+            if a_lc in k: 
+                return orig
     return None
 
 def parse_codebook_any(path: str) -> Tuple[pd.DataFrame, Dict[str, Dict], Dict[str, pd.DataFrame], Dict[str, str]]:
     """
     Devuelve:
-      - df_vars: DataFrame con columnas ['variable','tipo','descripcion','nuevo_nombre?']
+      - df_vars: DataFrame con columnas ['variable','tipo','descripcion','nuevo_nombre']
       - meta_lc: {variable_lower: {'type': str|None, 'map': {raw->label}}}
       - maps_por_var: {variable_lower: DataFrame(codigo, etiqueta)}
       - ren_lc: {variable_lower_original: nuevo_nombre_visible}  (para renombrar columnas)
@@ -109,6 +118,90 @@ def parse_codebook_any(path: str) -> Tuple[pd.DataFrame, Dict[str, Dict], Dict[s
     meta: Dict[str, Dict] = {}
     maps_por_var: Dict[str, pd.DataFrame] = {}
     ren_map_raw: Dict[str, str] = {}
+
+    for s, df in dfs.items():
+        if df is None or df.empty:
+            continue
+
+        # --- Detecta columnas con nombres “similares” a los de tu codebook
+        var_col  = _find_col(df, "variable","var","nombre","campo","name")
+        tipo_col = _find_col(df, "tipo","type","data_type","clase","class","tipo de variable")
+        desc_col = _find_col(df, "descripcion","descripción","description","detalle","definicion","definición","etiqueta de variable (desc)")
+        newn_col = _find_col(df, "nuevo_nombre","new_name","etiqueta_variable","etiqueta de variable",
+                                  "label_variable","display_name","nombre_publico","nombre público","nombre mostrado")
+        code_col = _find_col(df, "valor","value","code","código","codigo","option_value","código")
+        lab_col  = _find_col(df, "etiqueta","label","meaning","categoria","categoría",
+                                  "option_label","etiqueta del código","etiqueta del codigo")
+
+        # --- Variables (nombre visible y tipo)
+        if var_col:
+            tmp = df[df[var_col].notna()][[var_col] + ([tipo_col] if tipo_col else []) + ([newn_col] if newn_col else [])].copy()
+            # Renombra columnas normalizadas
+            rename_map = {var_col: "variable"}
+            if tipo_col: rename_map[tipo_col] = "tipo"
+            if newn_col: rename_map[newn_col] = "nuevo_nombre"
+            tmp = tmp.rename(columns=rename_map)
+            tmp["variable"] = tmp["variable"].astype(str).str.strip()
+            if "tipo" in tmp.columns:
+                tmp["tipo"] = tmp["tipo"].astype(str).str.strip()
+            if "nuevo_nombre" in tmp.columns:
+                tmp["nuevo_nombre"] = tmp["nuevo_nombre"].astype(str).str.strip()
+            df_vars = (pd.concat([df_vars, tmp], ignore_index=True)
+                         .drop_duplicates(subset=["variable"], keep="first"))
+
+        # --- Renombrado visible
+        if newn_col and var_col:
+            for _, r in df.dropna(subset=[var_col, newn_col]).iterrows():
+                v = str(r[var_col]).strip()
+                nn = str(r[newn_col]).strip()
+                if v and nn:
+                    ren_map_raw[v] = nn
+
+        # --- Mapeos de valores (formato largo con ffill)
+        if var_col and code_col and lab_col:
+            t = df[[var_col, code_col, lab_col]].copy()
+            t[var_col] = t[var_col].ffill()
+            t = t.dropna(subset=[code_col, lab_col])
+            for _, r in t.iterrows():
+                v = str(r[var_col]).strip()
+                k = str(r[code_col]).strip().rstrip(".0")
+                lbl = None if pd.isna(r[lab_col]) else str(r[lab_col]).strip()
+                meta.setdefault(v, {"type": None, "map": {}})
+                meta[v]["map"][k] = lbl
+
+        # --- Tipos desde la hoja si no estaban
+        if var_col and tipo_col:
+            for _, r in df.dropna(subset=[var_col, tipo_col]).iterrows():
+                v = str(r[var_col]).strip()
+                vt = str(r[tipo_col]).strip().lower()
+                meta.setdefault(v, {"type": None, "map": {}})
+                if meta[v]["type"] is None:
+                    meta[v]["type"] = vt
+
+    # Completar df_vars con tipos del meta si faltan
+    if not df_vars.empty:
+        df_vars = df_vars.drop_duplicates(subset=["variable"])
+        df_vars["tipo"] = df_vars.apply(lambda r: (meta.get(str(r["variable"]), {}).get("type") or r.get("tipo")), axis=1)
+    else:
+        # si no hubo filas “variables”, construimos desde meta
+        df_vars = pd.DataFrame([{
+            "variable": v, "tipo": meta.get(v,{}).get("type"), "descripcion": None, "nuevo_nombre": ren_map_raw.get(v)
+        } for v in meta.keys()])
+
+    # Tablas de mapeo por variable (útil para Tab 2)
+    for v, info in meta.items():
+        mp = info.get("map", {}) or {}
+        if mp:
+            df_map = pd.DataFrame({"codigo": list(mp.keys()), "etiqueta": [mp[k] for k in mp.keys()]})
+            maps_por_var[v] = df_map.sort_values("codigo", key=lambda s: s.astype(str))
+
+    # Normaliza a lowercase para acceso robusto
+    meta_lc = {to_lower(k): {"type": v.get("type"), "map": v.get("map", {})} for k, v in meta.items()}
+    ren_lc  = {to_lower(k): ren_map_raw[k] for k in ren_map_raw.keys()}
+    maps_lc = {to_lower(k): val for k, val in maps_por_var.items()}
+
+    return df_vars, meta_lc, maps_lc, ren_lc
+
 
     def _ingesta_vars(df):
         nonlocal df_vars, ren_map_raw
@@ -373,9 +466,12 @@ df_display = apply_codebook(base_df, df_vars, meta_lc, ren_lc, apply_labels=appl
 
 # ====== Filtros comunes ======
 def sector_column(df):
-    for cand in ["SECTOR","sector","Sector","BLOQUE","bloque","Bloque"]:
-        if cand in df.columns: return cand
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if "sector" in cl or "bloque" in cl:
+            return c
     return None
+
 
 sector_col = sector_column(df_display)
 
