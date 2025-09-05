@@ -1,11 +1,22 @@
 
+import os, json
 import streamlit as st
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 
+# Intentar importar pydeck; si no está, la app hará fallback a st.map
+try:
+    import pydeck as pdk  # type: ignore
+    _HAS_PYDECK = True
+except Exception:
+    _HAS_PYDECK = False
+
 st.set_page_config(page_title="Dashboard Territorio: Estructuras y Hogares", layout="wide")
 
+# ============================
+# Utilidades
+# ============================
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -44,6 +55,9 @@ def coerce_datetime(s: pd.Series) -> pd.Series:
     except Exception:
         return s
 
+# ============================
+# Codebook: parsing flexible
+# ============================
 def parse_codebook(df_cb: pd.DataFrame) -> Dict[str, Dict]:
     meta: Dict[str, Dict] = {}
     if df_cb is None or df_cb.empty:
@@ -147,12 +161,6 @@ def apply_codebook_types_and_labels(df: pd.DataFrame, meta: Dict[str, Dict], app
 
     return out
 
-def coerce_datetime(s: pd.Series) -> pd.Series:
-    try:
-        return pd.to_datetime(s, errors="ignore", infer_datetime_format=True)
-    except Exception:
-        return s
-
 def rank_join_candidates(cols_a: List[str], cols_b: List[str]) -> List[str]:
     la = to_lower_set(cols_a)
     lb = to_lower_set(cols_b)
@@ -173,13 +181,21 @@ def pick_original_name(df: pd.DataFrame, lower_name: str) -> Optional[str]:
             return c
     return None
 
-# Sidebar inputs with defaults pointing to repo paths
+# ============================
+# Sidebar: Entrada de datos
+# ============================
 st.sidebar.header("Datos de entrada")
 codebook_path = st.sidebar.text_input("Ruta Codebook", "data/metadata/Codebook.xlsx")
 estructuras_path = st.sidebar.text_input("Ruta Estructuras", "data/private/basedarboard.xlsx")
 hogares_path = st.sidebar.text_input("Ruta Hogares", "data/private/hogares.xlsx")
 apply_labels = st.sidebar.checkbox("Aplicar etiquetas del codebook (si existen)", value=True)
 
+# Capa de límites (GeoJSON exportado desde ArcGIS Pro)
+limite_path = st.sidebar.text_input("Ruta límites (GeoJSON)", "data/gis/areas_intervencion.geojson")
+mostrar_limites = st.sidebar.checkbox("Mostrar límites de intervención", value=True)
+relleno_limites = st.sidebar.checkbox("Rellenar polígonos", value=False)
+
+# Carga de archivos
 with st.spinner("Leyendo archivos..."):
     try:
         df_cb, _ = load_excel_first_sheet(codebook_path)
@@ -205,6 +221,9 @@ df_hog = normalize_cols(df_hog) if not df_hog.empty else df_hog
 
 meta = parse_codebook(df_cb)
 
+# ============================
+# Unión Estructuras ↔ Hogares
+# ============================
 st.sidebar.subheader("Unión Estructuras ↔ Hogares")
 if df_estr.empty:
     st.warning("No hay datos de Estructuras cargados.")
@@ -223,8 +242,8 @@ if not df_estr.empty and not df_hog.empty:
 
     if join_key != "(no unir)":
         key_hog = pick_original_name(df_hog, join_key.lower())
-        if key_hog is None:
-            key_hog = pick_original_name(df_hog, cands[0]) if cands else None
+        if key_hog is None and cands:
+            key_hog = pick_original_name(df_hog, cands[0])
 
         if key_hog is None:
             st.error("No se encontró la columna equivalente en Hogares.")
@@ -237,12 +256,16 @@ if not df_estr.empty and not df_hog.empty:
 
 df_display = apply_codebook_types_and_labels(df_joined, meta, apply_labels=apply_labels)
 
+# ============================
+# Tabs principales
+# ============================
 tab1, tab2 = st.tabs(["📊 Análisis", "📖 Diccionario"])
 
 with tab1:
     st.title("Dashboard del Territorio")
     st.caption("Filtra y explora la información de estructuras y hogares.")
 
+    # ---------- Filtros ----------
     st.sidebar.subheader("Filtros")
     if df_display.empty:
         st.info("No hay datos para filtrar.")
@@ -265,6 +288,7 @@ with tab1:
             if picks:
                 filtered = filtered[filtered[col].isin(picks)]
 
+    # ---------- KPIs ----------
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Registros (vista)", len(filtered))
     with c2: st.metric("Variables", filtered.shape[1] if not filtered.empty else 0)
@@ -283,24 +307,70 @@ with tab1:
 
     st.divider()
 
-    if not filtered.empty:
-        lat_col, lon_col = guess_lat_lon(filtered)
-        if lat_col and lon_col:
-            try:
-                mdf = filtered[[lat_col, lon_col]].dropna().copy()
-                mdf = mdf.rename(columns={lat_col: "lat", lon_col: "lon"})
-                mdf["lat"] = pd.to_numeric(mdf["lat"], errors="coerce")
-                mdf["lon"] = pd.to_numeric(mdf["lon"], errors="coerce")
-                mdf = mdf.dropna(subset=["lat", "lon"])
-                if not mdf.empty:
-                    st.subheader("Mapa (vista rápida)")
-                    st.map(mdf, size=3, zoom=11)
-                else:
-                    st.info("No hay coordenadas válidas para mapear tras aplicar filtros.")
-            except Exception as e:
-                st.warning(f"No fue posible renderizar el mapa: {e}")
+    # ---------- Mapa con límites ----------
+    lat_col, lon_col = guess_lat_lon(filtered)
+
+    if mostrar_limites and os.path.exists(limite_path) and _HAS_PYDECK:
+        try:
+            with open(limite_path, "r", encoding="utf-8") as f:
+                gj = json.load(f)
+
+            layer_lim = pdk.Layer(
+                "GeoJsonLayer",
+                data=gj,
+                stroked=True,
+                filled=bool(relleno_limites),
+                get_line_color=[0, 0, 0, 220],
+                get_line_width=2,
+                get_fill_color=[255, 255, 255, 30],
+                pickable=True,
+            )
+
+            layer_pts = None
+            if lat_col and lon_col and not filtered.empty:
+                pts = filtered[[lat_col, lon_col]].dropna().rename(columns={lat_col:"lat", lon_col:"lon"})
+                pts["lat"] = pd.to_numeric(pts["lat"], errors="coerce")
+                pts["lon"] = pd.to_numeric(pts["lon"], errors="coerce")
+                pts = pts.dropna()
+                if not pts.empty:
+                    layer_pts = pdk.Layer(
+                        "ScatterplotLayer",
+                        data=pts,
+                        get_position="[lon, lat]",
+                        get_radius=25,
+                        get_fill_color=[0, 128, 255, 160],
+                        pickable=False,
+                    )
+
+            if lat_col and lon_col and not filtered.empty and not pts.empty:
+                center_lat, center_lon = float(pts["lat"].median()), float(pts["lon"].median())
+            else:
+                center_lat, center_lon = 13.494, -89.322  # Puerto de La Libertad (aprox.)
+
+            st.subheader("Mapa (límites de intervención + puntos)")
+            st.pydeck_chart(pdk.Deck(
+                map_style=None,
+                initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=11),
+                layers=[l for l in [layer_lim, layer_pts] if l is not None],
+            ))
+        except Exception as e:
+            st.warning(f"No se pudo renderizar la capa de límites: {e}")
+    else:
+        # Fallback: mapa simple con puntos (sin límites o sin pydeck)
+        if mostrar_limites and not _HAS_PYDECK:
+            st.info("Instala pydeck en requirements.txt para ver los límites (pydeck>=0.8,<1). Mostrando mapa simple de puntos.")
+        if lat_col and lon_col and not filtered.empty:
+            mdf = filtered[[lat_col, lon_col]].dropna().rename(columns={lat_col:"lat", lon_col:"lon"})
+            mdf["lat"] = pd.to_numeric(mdf["lat"], errors="coerce")
+            mdf["lon"] = pd.to_numeric(mdf["lon"], errors="coerce")
+            mdf = mdf.dropna()
+            if not mdf.empty:
+                st.subheader("Mapa")
+                st.map(mdf, size=3, zoom=11)
+            else:
+                st.info("No hay coordenadas válidas para mapear tras aplicar filtros.")
         else:
-            st.info("No se detectaron columnas estándar de latitud/longitud (intente renombrar o ajustar el codebook).")
+            st.info("No se detectaron columnas estándar de latitud/longitud.")
 
     st.subheader("Tabla filtrada")
     st.dataframe(filtered, use_container_width=True, height=420)
@@ -314,6 +384,7 @@ with tab1:
 
     st.divider()
 
+    # ---------- Exploración rápida ----------
     if not filtered.empty:
         num_cols = [c for c in filtered.columns if pd.api.types.is_numeric_dtype(filtered[c])]
         if num_cols:
@@ -335,3 +406,5 @@ with tab2:
     else:
         st.dataframe(df_cb, use_container_width=True, height=600)
         st.caption("Activa 'Aplicar etiquetas del codebook' en la barra lateral para ver categorías decodificadas cuando existan.")
+
+st.caption("⚙️ Nota: Para ver límites con pydeck, agrega 'pydeck>=0.8,<1' en requirements.txt. La app hace fallback a un mapa simple si no está disponible.")
