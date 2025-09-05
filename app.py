@@ -87,36 +87,55 @@ def geojson_center(gj: dict) -> Tuple[float,float]:
         return (acc[1]+acc[3])/2.0, (acc[0]+acc[2])/2.0
     return 13.494, -89.322  # fallback
 
-# ====== Codebook (parser robusto) ======
+# ====== Codebook (parser robusto + renombrado) ======
 def _find_col(cb, *aliases):
     cols = {to_lower(c): c for c in cb.columns}
     for a in aliases:
         if a in cols: return cols[a]
     return None
 
-def parse_codebook_any(path: str) -> Tuple[pd.DataFrame, Dict[str, Dict], Dict[str, pd.DataFrame]]:
+def parse_codebook_any(path: str) -> Tuple[pd.DataFrame, Dict[str, Dict], Dict[str, pd.DataFrame], Dict[str, str]]:
+    """
+    Devuelve:
+      - df_vars: DataFrame con columnas ['variable','tipo','descripcion','nuevo_nombre?']
+      - meta_lc: {variable_lower: {'type': str|None, 'map': {raw->label}}}
+      - maps_por_var: {variable_lower: DataFrame(codigo, etiqueta)}
+      - ren_lc: {variable_lower_original: nuevo_nombre_visible}  (para renombrar columnas)
+    """
     xls = pd.ExcelFile(path)
     dfs = {s: normalize_cols(pd.read_excel(path, sheet_name=s)) for s in xls.sheet_names}
 
-    df_vars = pd.DataFrame(columns=["variable","tipo","descripcion"])
+    df_vars = pd.DataFrame(columns=["variable","tipo","descripcion","nuevo_nombre"])
     meta: Dict[str, Dict] = {}
     maps_por_var: Dict[str, pd.DataFrame] = {}
+    ren_map_raw: Dict[str, str] = {}
 
     def _ingesta_vars(df):
-        nonlocal df_vars
+        nonlocal df_vars, ren_map_raw
         if df is None or df.empty: return
-        var_col = _find_col(df, "variable","var","nombre","campo","name")
+        var_col  = _find_col(df, "variable","var","nombre","campo","name")
         tipo_col = _find_col(df, "tipo","type","data_type","clase","class")
         desc_col = _find_col(df, "descripcion","descripción","description","label","detalle","definicion","definición")
+        newn_col = _find_col(df, "nuevo_nombre","new_name","etiqueta_variable","label_variable","nombre_publico","nombre_mostrado","display_name")
+
         if var_col:
             tmp = pd.DataFrame({
                 "variable": df[var_col].astype(str).str.strip(),
                 "tipo": df[tipo_col].astype(str).str.strip() if tipo_col else None,
-                "descripcion": df[desc_col].astype(str).str.strip() if desc_col else None
+                "descripcion": df[desc_col].astype(str).str.strip() if desc_col else None,
+                "nuevo_nombre": df[newn_col].astype(str).str.strip() if newn_col else None
             })
             tmp = tmp.dropna(subset=["variable"])
+            # agrega a df_vars (sin duplicar variables)
             df_vars = (pd.concat([df_vars, tmp], ignore_index=True)
                         .drop_duplicates(subset=["variable"], keep="first"))
+            # renombres
+            if newn_col:
+                for _, r in df.dropna(subset=[var_col, newn_col]).iterrows():
+                    v = str(r[var_col]).strip()
+                    nn = str(r[newn_col]).strip()
+                    if v and nn:
+                        ren_map_raw[v] = nn
 
     def _agrega_map(var, code, label):
         if var is None or str(var).strip()=="":
@@ -188,7 +207,7 @@ def parse_codebook_any(path: str) -> Tuple[pd.DataFrame, Dict[str, Dict], Dict[s
         )
     else:
         df_vars = pd.DataFrame(
-            [{"variable": v, "tipo": meta.get(v,{}).get("type"), "descripcion": None} for v in meta.keys()]
+            [{"variable": v, "tipo": meta.get(v,{}).get("type"), "descripcion": None, "nuevo_nombre": None} for v in meta.keys()]
         )
 
     # Tablas de mapeo por variable
@@ -202,15 +221,38 @@ def parse_codebook_any(path: str) -> Tuple[pd.DataFrame, Dict[str, Dict], Dict[s
     # Keys a lowercase para acceso flexible
     meta_lc = {to_lower(k): {"type": v.get("type"), "map": v.get("map", {})} for k,v in meta.items()}
     maps_lc = {to_lower(k): val for k,val in maps_por_var.items()}
-    # df_vars tal cual (con nombres originales)
-    return df_vars, meta_lc, maps_lc
+    # Mapa de renombrado a lowercase
+    ren_lc = {to_lower(k): ren_map_raw[k] for k in ren_map_raw.keys()}
 
-def apply_codebook(df: pd.DataFrame, df_vars: pd.DataFrame, meta_lc: Dict[str, Dict], apply_labels: bool=True) -> pd.DataFrame:
+    return df_vars, meta_lc, maps_lc, ren_lc
+
+def apply_codebook(df: pd.DataFrame, df_vars: pd.DataFrame, meta_lc: Dict[str, Dict], ren_lc: Dict[str, str], apply_labels: bool=True) -> pd.DataFrame:
+    """
+    - Renombra columnas según ren_lc si existe nombre público/nuevo.
+    - Tipifica por 'tipo' (numérico/fecha).
+    - Aplica mapeos de etiquetas a valores.
+    """
     if df is None or df.empty: return df
     out = df.copy()
-    cols_lower = {to_lower(c): c for c in out.columns}
+    out.columns = [str(c).strip() for c in out.columns]
 
-    # Tipificar por 'tipo'
+    # 1) Renombrar columnas según codebook (evita colisiones)
+    cols_lower = {to_lower(c): c for c in out.columns}
+    new_names = {}
+    taken = set(out.columns)
+    for v_lower, col in cols_lower.items():
+        if v_lower in ren_lc:
+            cand = str(ren_lc[v_lower]).strip()
+            if cand and cand not in taken:
+                new_names[col] = cand
+                taken.add(cand)
+            # si colisiona, deja nombre original para no romper
+    if new_names:
+        out = out.rename(columns=new_names)
+        # reconstruye cols_lower luego del rename
+        cols_lower = {to_lower(c): c for c in out.columns}
+
+    # 2) Tipificar por 'tipo'
     tipos = {}
     if df_vars is not None and not df_vars.empty:
         for _, r in df_vars.iterrows():
@@ -228,8 +270,10 @@ def apply_codebook(df: pd.DataFrame, df_vars: pd.DataFrame, meta_lc: Dict[str, D
                 try: out[col] = pd.to_datetime(out[col], errors="ignore", infer_datetime_format=True)
                 except Exception: pass
 
-    # Aplicar mapeos
+    # 3) Aplicar mapeos de etiquetas
     if apply_labels and meta_lc:
+        # re-calcula cols_lower por si cambió algo
+        cols_lower = {to_lower(c): c for c in out.columns}
         for v_lower, col in cols_lower.items():
             info = meta_lc.get(v_lower)
             if not info: continue
@@ -293,10 +337,10 @@ with st.spinner("Leyendo archivos…"):
             return pd.DataFrame()
     # Codebook robusto
     try:
-        df_vars, meta_lc, maps_por_var = parse_codebook_any(codebook_path)
+        df_vars, meta_lc, maps_por_var, ren_lc = parse_codebook_any(codebook_path)
     except Exception as e:
         st.warning(f"No se pudo parsear el codebook: {e}.")
-        df_vars, meta_lc, maps_por_var = pd.DataFrame(), {}, {}
+        df_vars, meta_lc, maps_por_var, ren_lc = pd.DataFrame(), {}, {}, {}
 
     df_estr = load_or_empty(estructuras_path)
     df_hog  = load_or_empty(hogares_path)
@@ -324,8 +368,8 @@ if dataset_choice=="Solo Estructuras": base_df=df_estr
 elif dataset_choice=="Solo Hogares":   base_df=df_hog
 else:                                  base_df=df_joined
 
-# Aplicar codebook
-df_display = apply_codebook(base_df, df_vars, meta_lc, apply_labels=apply_labels)
+# Aplicar codebook (incluye RENOMBRADO si hay 'nuevo_nombre' en el codebook)
+df_display = apply_codebook(base_df, df_vars, meta_lc, ren_lc, apply_labels=apply_labels)
 
 # ====== Filtros comunes ======
 def sector_column(df):
@@ -343,9 +387,11 @@ with tab1:
     st.title("Dashboard del Territorio")
     st.caption("Filtros, KPIs y mapa con límites de intervención.")
 
-    # Filtros normales
+    # ---------- Filtros (con hotfix de defaults válidos) ----------
     st.sidebar.subheader("Filtros")
     cats = low_card_cats(df_display)
+
+    # candidatos por defecto (pueden NO ser de baja cardinalidad)
     defaults=[]
     lcols=[c.lower() for c in df_display.columns]
     for t in ["departamento","municipio","distrito","sector","es_hogar","hogar"]:
@@ -359,7 +405,20 @@ with tab1:
     else:
         pick_sector = None
 
-    other_selected = st.sidebar.multiselect("Otras columnas para filtrar (categóricas)", options=[c for c in cats if c!=sector_col], default=defaults)
+    options_cats = [c for c in cats if c!=sector_col]
+    valid_defaults = [d for d in defaults if d in options_cats]
+
+    if options_cats:
+        other_selected = st.sidebar.multiselect(
+            "Otras columnas para filtrar (categóricas)",
+            options=options_cats,
+            default=valid_defaults
+        )
+    else:
+        st.sidebar.caption("No se detectaron columnas categóricas de baja cardinalidad.")
+        other_selected = []
+
+    # Aplica filtros
     filtered = df_display.copy()
     if sector_col and pick_sector:
         filtered = filtered[filtered[sector_col].astype(str).isin(pick_sector)]
@@ -545,6 +604,12 @@ with tab3:
         st.stop()
 
     # --------- Filtro por Sector/Bloque ---------
+    def sector_column(df):
+        for cand in ["SECTOR","sector","Sector","BLOQUE","bloque","Bloque"]:
+            if cand in df.columns: return cand
+        return None
+    sector_col = sector_column(df_display)
+
     if sector_col:
         sectores = sorted(df_display[sector_col].dropna().astype(str).unique().tolist())
         sectors_pick = st.multiselect("Sector/Bloque", sectores, default=sectores)
@@ -593,14 +658,13 @@ with tab3:
         st.dataframe(dd.round(2), use_container_width=True, height=360)
         st.download_button(f"⬇️ Descargar {label or 'estadisticos'}", dd.to_csv().encode("utf-8-sig"), f"stats_{'_'.join(cols[:3])}.csv", "text/csv")
 
-    # Heurística de p004 (uso): acepta códigos o etiquetas
+    # Heurística de p004 (uso)
     uso_col = "p004" if "p004" in df_anx.columns else next((c for c in df_anx.columns if to_lower(c) in ["uso","uso_estructura","p004_uso"]), None)
     def uso_cat(val):
         s = to_lower(val)
         if s in ["1","vivienda","residencial","hogar"]: return "vivienda"
         if s in ["2","negocio","comercial","empresa"]: return "negocio"
         if s in ["3","mixto","mixta","vivienda/negocio","residencial/comercial"]: return "mixto"
-        # fallback por substring
         if "vivi" in s: return "vivienda"
         if "nego" in s or "comer" in s or "emp" in s: return "negocio"
         if "mixt" in s: return "mixto"
@@ -665,7 +729,6 @@ with tab3:
         if (var in df_hh.columns) and col_sex_jef:
             crosstab(df_hh, col_sex_jef, var, label=f"Sexo jefatura × {name}")
     if col_p011 and col_sex_jef:
-        # tamaño por sexo jefatura (estadísticos)
         sumstats(df_hh.groupby(col_sex_jef)[col_p011].apply(pd.to_numeric, errors="coerce").reset_index(name=col_p011),
                  [col_p011], "Tamaño del hogar (p011) por sexo jefatura")
 
@@ -683,7 +746,6 @@ with tab3:
 
     if col_p014 and col_sex_jef: crosstab(df_hh, col_p014, col_sex_jef, label="Fuente de ingreso × Sexo jefatura")
     if col_p013 and col_p011:
-        # Relación Nº con ingresos vs tamaño hogar: estadísticos por cuartiles de tamaño
         tmp = df_hh[[col_p013, col_p011]].apply(pd.to_numeric, errors="coerce").dropna()
         if not tmp.empty:
             tmp["q_tam"] = pd.qcut(tmp[col_p011], q=min(4, tmp[col_p011].nunique()), duplicates="drop")
@@ -723,7 +785,6 @@ with tab3:
     if "p025" in df_neg.columns and "p027" in df_neg.columns: crosstab(df_neg, "p025", "p027", label="Actividad × Permisos")
     if "p027" in df_neg.columns and "p028" in df_neg.columns: crosstab(df_neg, "p027", "p028", label="Permisos × Tenencia local")
     if "p030" in df_neg.columns and "p029" in df_neg.columns:
-        # relación empleados formales vs total
         tmp = df_neg[["p029","p030"]].apply(pd.to_numeric, errors="coerce").dropna()
         if not tmp.empty:
             tmp["formales_%"] = np.where(tmp["p029"]>0, tmp["p030"]/tmp["p029"]*100, np.nan)
@@ -766,7 +827,7 @@ with tab3:
     # % hogares con jefatura femenina
     if col_sex_jef:
         s = df_hh[col_sex_jef].astype(str).str.lower()
-        ind["% hogares con jefatura femenina"] = s.str.contains("fem").mean()*100
+        ind["% hogares con jefatura femenina"] = s.str_contains("fem").mean()*100 if hasattr(s, "str_contains") else s.str.contains("fem").mean()*100
     # % hogares con tenencia precaria (heurística: arriendo informal/cedido/ocupación)
     if col_p010:
         s = df_hh[col_p010].astype(str).str.lower()
@@ -798,7 +859,10 @@ with tab3:
         for k,v in ind.items():
             with card_cols[i%len(card_cols)]:
                 if isinstance(v, (int,float)) and not pd.isna(v):
-                    st.metric(k, f"{v:.1f}%" if '%%' not in k and 'Promedio' not in k and 'Promedio' not in k else f"{v:.1f}")
+                    if 'Promedio' in k:
+                        st.metric(k, f"{v:.1f}")
+                    else:
+                        st.metric(k, f"{v:.1f}%")
                 else:
                     st.metric(k, "—")
             i+=1
